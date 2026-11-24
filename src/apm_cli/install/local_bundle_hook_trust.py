@@ -41,6 +41,8 @@ class UnadmittedBundleHooks:
 class _BundleHookState:
     keys: set[str | None] = field(default_factory=set)
     hook_files: set[str] = field(default_factory=set)
+    # Sidecars whose approval records could not be read (#5144).
+    unreadable: set[str] = field(default_factory=set)
 
 
 def _merged_hook_documents(project_root: Path, targets: Any):
@@ -96,10 +98,13 @@ def _collect_per_file(
     for target in _per_file_targets(targets):
         target_root = Path(project_root) / target.root_dir
         recorded: set[str] = set()
+        unreadable = None
         try:
             records = per_file_bundle_hook_keys(target_root / _APM_HOOKS_SIDECAR)
         except (OSError, ValueError, TypeError):
+            # A corrupt record proves no approval; audit names the sidecar.
             records = {}
+            unreadable = _record_value(target_root / _APM_HOOKS_SIDECAR, Path(project_root))
         for slug, (key, files) in records.items():
             state = found.setdefault(slug, _BundleHookState())
             state.keys.add(key)
@@ -122,6 +127,8 @@ def _collect_per_file(
             state = found.setdefault(slug, _BundleHookState())
             state.keys.add(None)
             state.hook_files.add(value)
+            if unreadable is not None:
+                state.unreadable.add(unreadable)
 
 
 def deployed_bundle_hook_keys(
@@ -190,7 +197,14 @@ def unadmitted_bundle_hooks(
     for slug, state in sorted(deployed.items()):
         keys = state.keys
         files = tuple(sorted(state.hook_files))
-        if None in keys:
+        if state.unreadable:
+            from apm_cli.utils.diagnostics import printable_ascii_text
+
+            where = printable_ascii_text(", ".join(sorted(state.unreadable)))
+            result.append(
+                UnadmittedBundleHooks(slug, f"approval record in {where} is unreadable", files)
+            )
+        elif None in keys:
             result.append(UnadmittedBundleHooks(slug, REASON_UNRECORDED, files))
         elif not all(package_type_approved(allow_map, (key,), EXEC_TYPE_HOOKS) for key in keys):
             result.append(UnadmittedBundleHooks(slug, REASON_NOT_GRANTED, files))
